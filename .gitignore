@@ -1,0 +1,16 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# local env (NEVER commit real secrets)
+.env
+.env.local
+
+# netlify
+.netlify/
+
+# misc
+.DS_Store
+*.log
