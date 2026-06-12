@@ -1,70 +1,57 @@
-// _auth.js — sign-in enforcement shared by every Netlify Function.
+// _sheets.js — shared Google Sheets helper for the Netlify Functions.
 // Files prefixed with "_" are NOT deployed as endpoints; they're imported by the others.
-//
-// The browser sends the signed-in user's Google ID token as "Authorization: Bearer <token>".
-// requireUser() verifies that token with Google, then runs it past two gates, BOTH set via
-// environment variables (Netlify -> Site configuration -> Environment variables):
-//
-//   ALLOWED_DOMAIN  — only accept accounts on this Workspace domain (e.g. solarsquare.in).
-//   ALLOWED_EMAILS  — comma/space/newline-separated allowlist of the EXACT people allowed to
-//                     use the app (your admins). Leave blank to allow ANY verified account on
-//                     ALLOWED_DOMAIN; set it to lock the app to a named list.
-//
-// This is the REAL gate. The login screen in the browser is just UX — without this, the
-// /api/* endpoints would still hand data to anyone who hits the URL directly.
-const { json } = require('./_sheets');
+// Auth uses a Google service account (no end-user consent needed). Share your Sheet with
+// the service account's email as an Editor.
+const { google } = require('googleapis');
 
-function parseList(v) {
-  return String(v || '').split(/[,\s]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
+function sheetsClient() {
+  const auth = new google.auth.JWT(
+    process.env.GOOGLE_SA_EMAIL,
+    null,
+    (process.env.GOOGLE_SA_KEY || '').replace(/\\n/g, '\n'),
+    ['https://www.googleapis.com/auth/spreadsheets']
+  );
+  return google.sheets({ version: 'v4', auth });
 }
 
-function bearer(event) {
-  const h = (event && event.headers) || {};
-  const raw = h.authorization || h.Authorization || '';
-  const m = /^Bearer\s+(.+)$/i.exec(String(raw).trim());
-  return m ? m[1] : '';
+async function readSheet(range) {
+  const s = sheetsClient();
+  const res = await s.spreadsheets.values.get({ spreadsheetId: process.env.SHEET_ID, range });
+  return res.data.values || [];
 }
 
-// Verify the caller and check both gates. Returns { ok, status, user, reason }.
-async function requireUser(event) {
-  const token = bearer(event);
-  if (!token) return { ok: false, status: 401, reason: 'not-signed-in' };
+async function appendRow(range, row) {
+  const s = sheetsClient();
+  await s.spreadsheets.values.append({
+    spreadsheetId: process.env.SHEET_ID,
+    range,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [row] },
+  });
+}
 
-  let p;
-  try {
-    const r = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(token));
-    if (!r.ok) return { ok: false, status: 401, reason: 'invalid-token' };
-    p = await r.json();
-  } catch (e) {
-    return { ok: false, status: 401, reason: 'verify-failed' };
+// values[] (incl. header row) -> array of objects keyed by trimmed header (whitespace-tolerant)
+function rowsToObjects(values) {
+  if (!values || values.length < 2) return [];
+  const head = values[0].map(h => String(h).trim());
+  return values.slice(1).map(r => {
+    const o = {}; head.forEach((h, i) => { o[h] = r[i]; }); return o;
+  });
+}
+
+// Tolerant field lookup: matches a header by any of `candidates`, ignoring case, spaces,
+// underscores and punctuation. So "TL Email", "tl_email", "Team Lead Email" all resolve.
+function pick(row, candidates) {
+  const squash = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const want = candidates.map(squash);
+  for (const rk of Object.keys(row)) {
+    if (want.indexOf(squash(rk)) >= 0) return row[rk];
   }
-
-  // The token must have been minted for OUR OAuth client (prevents replaying a token that
-  // some other app on the same domain issued).
-  const aud = process.env.VITE_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
-  if (aud && p.aud && p.aud !== aud) return { ok: false, status: 401, reason: 'wrong-audience' };
-  if (p.email_verified === false || p.email_verified === 'false') return { ok: false, status: 401, reason: 'email-unverified' };
-
-  const email = String(p.email || '').toLowerCase();
-  if (!email) return { ok: false, status: 401, reason: 'no-email' };
-
-  const domain = (process.env.ALLOWED_DOMAIN || '').toLowerCase();
-  if (domain && p.hd !== domain && !email.endsWith('@' + domain)) {
-    return { ok: false, status: 403, reason: 'wrong-domain' };
-  }
-
-  const allow = parseList(process.env.ALLOWED_EMAILS);
-  if (allow.length && allow.indexOf(email) < 0) {
-    return { ok: false, status: 403, reason: 'not-authorized' };
-  }
-
-  return { ok: true, status: 200, user: { email, name: p.name || '', picture: p.picture || '' } };
+  return '';
 }
 
-// Standard refusal body. `authError:true` tells the frontend to show the login / access-denied
-// screen rather than silently falling back to demo data.
-function deny(res) {
-  return json(res.status || 401, { error: res.reason || 'unauthorized', authError: true });
+function json(status, body) {
+  return { statusCode: status, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }
 
-module.exports = { requireUser, deny, parseList };
+module.exports = { readSheet, appendRow, rowsToObjects, pick, json };

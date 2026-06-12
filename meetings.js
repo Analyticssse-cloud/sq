@@ -1,29 +1,29 @@
-// config.js  →  GET /api/config
-// Serves the PUBLIC front-end auth config, read from environment variables at RUNTIME.
-//
-// Why this exists: VITE_* variables are compiled into the JS at *build* time, so if Netlify
-// doesn't expose them to the build (wrong scope/context) the gate silently turns off. Reading
-// them here at runtime removes that whole class of failure — change the client ID in Netlify
-// and it takes effect on the next request, no rebuild needed.
-//
-// Only NON-secret values are returned (the OAuth *client ID* is public by design; it ships in
-// every browser anyway). The service-account key, allowlist, etc. are NEVER sent here.
-const { json } = require('./_sheets');
+// employees.js  →  GET /api/employees
+// Returns the EmployeeMaster tab as objects. Powers the LRM autocomplete + auto-fill,
+// and supplies the LRM->TL mapping. Header matching is tolerant (case/space/underscore),
+// so "TL Email", "tl_email", "Team Lead Email" all resolve.
+const { readSheet, rowsToObjects, pick, json } = require('./_sheets');
+const { requireUser, deny } = require('./_auth');
 
-exports.handler = async () => {
-  const clientId = process.env.VITE_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID || '';
-  const allowedDomain = (process.env.ALLOWED_DOMAIN || process.env.VITE_ALLOWED_DOMAIN || '').toLowerCase();
-  const allowlist = String(process.env.ALLOWED_EMAILS || process.env.VITE_ALLOWED_EMAILS || '')
-    .split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
-
-  return json(200, {
-    // gate is ON whenever a client ID is configured
-    enabled: !!clientId,
-    clientId,
-    allowedDomain,
-    // booleans only — we don't leak the actual admin list to the browser
-    restricted: allowlist.length > 0,
-  });
+exports.handler = async (event) => {
+  const auth = await requireUser(event);
+  if (!auth.ok) return deny(auth);
+  try {
+    const rows = rowsToObjects(await readSheet('EmployeeMaster!A:Z'));
+    const emps = rows.map(r => ({
+      name: pick(r, ['LRM Name', 'LRM', 'Agent Name', 'Name']),
+      email: pick(r, ['LRM Email', 'Agent Email', 'Email']),
+      tlName: pick(r, ['TL Name', 'Team Lead Name', 'Team Lead', 'TL']),
+      tlEmail: pick(r, ['TL Email', 'Team Lead Email', 'TL Mail']),
+      mgrName: pick(r, ['ZSM Name', 'Manager Name', 'ZSM']),
+      mgrEmail: pick(r, ['ZSM Email', 'Manager Email']),
+      adosName: pick(r, ['ADOS Name', 'ADOS']),
+      adosEmail: pick(r, ['ADOS Email']),
+    })).filter(e => e.name);
+    return json(200, emps);
+  } catch (e) {
+    return json(500, { error: String(e && e.message || e) });
+  }
 };
 
 // --- Vercel adapter: expose the handler as a Vercel serverless function ---
